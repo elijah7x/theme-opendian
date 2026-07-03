@@ -74,6 +74,7 @@ DEV_VAULT 已通过 symlink 把本主题挂进 `../DEV_VAULT/.obsidian/themes/Op
 - `manifest.json` 的 `version` 是否需要 bump。
 - light + dark 都验过。
 - 没有顺手改到无关区段。
+- **如果要发版**：bump version 后打 tag（无 v 前缀，== version）并 `git push origin dev --tags`，workflow 自动接管（见「发版流程」）。
 
 > ⚠️ **别被 `versions.json` 误导。** 仓库里有 `versions.json`，但**那是插件（plugin）概念，主题（theme）根本不读它**。它不影响安装、也不影响市场可见性——留着无害，但**不要**当发版必做项，更别以为动它能修市场问题。
 
@@ -94,6 +95,10 @@ DEV_VAULT 已通过 symlink 把本主题挂进 `../DEV_VAULT/.obsidian/themes/Op
 > 是否 == manifest version（无 v）+ 资产是否齐。两头都要看。
 
 ## 🚨 红线：发版必须合规，否则会被踢出主题市场索引
+
+> **这些红线现在由 `release.yml` workflow 作为校验步骤强制执行**（见下「发版流程」）。
+> 但红线本身不会过时——它是 workflow 的设计依据，也是 workflow 故障时手动应急的核对清单。
+> 理解红线，才能理解 workflow 在防什么。
 
 **这是运营铁律，比任何代码改动都重要，牢记：**
 
@@ -120,35 +125,59 @@ gh api repos/elijahchan2019/obsidian-opendian-theme/releases --jq '.[]|select(.t
 > ——draft 不建 tag、不算 Latest、市场也看不到。若自检发现 `draft=true`，
 > 用 `gh release edit <版本> --draft=false --latest` 转正。
 
-## 发布前（dev → main 合并时）
+## 发版流程（tag 触发，GitHub Action 自动同步 main + 发 release）
 
-> 跨项目血泪：姊妹项目 Folio 就因为有人把发版 tag 加了 `v` 前缀（`v1.2.1`），导致
-> Obsidian 手动检测报「no GitHub release with that version」。Opendian 目前 tag 全是
-> 无前缀（`1.12.2`…），是对的——**别在这重蹈覆辙。**
+> 自 v1.12.4 起，发版由 `.github/workflows/release.yml` 自动化。**不再手动 merge dev→main、
+> 不再手动改 name、不再手动 rm 开发文件、不再手动 `gh release create`。** 这些步骤全部
+> 由 workflow 在 tag 推送时执行，红线（无 v、tag==version、资产齐、`--latest`、非 draft、
+> 无外部资源）作为显式校验步骤硬编码在内——任一不符直接 fail，发不出不合规的 release。
 
-1. **dev 上完成所有 commit + `version` bump**，`git push origin dev`。**不要**在 main 手改 `theme.css`。
-2. **切到 `../Opendian`（main）**，`git fetch origin`，合并 dev（ff-only 或 --no-ff 视是否 diverged）。
-3. **改 manifest 的 name**：merge 会带来 dev 的 `name: "Opendian-dev"`，**必须改回 `"Opendian"`**（否则发成了 dev 主题）。amend 进版本 commit 保持干净。
-3b. **main 不保留 `AGENTS.md`**（内部开发文档只活在 dev；main 是发布产物）。若合并带入或冲突，`git rm AGENTS.md` 保留删除；合并后 `git ls-files AGENTS.md` 应为空。
-4. **push main，一条命令建 release**（tag + 资产 + Latest + 说明一把到位）：
+### 日常发版（你的全部操作）
 
-   **三条铁律，每条 Folio 都踩过：**
-   - **① tag 名 = manifest `version`，绝不带 `v` 前缀。** Obsidian 按 manifest `version`
-     字符串找同名 release，带 `v` 会检测报错。
-   - **② 挂全资产**：至少 `theme.css` + `manifest.json`（惯例连 README/截图一起挂）。
-   - **③ 显式 `--latest`**：GitHub 默认按发布时间判定，乱序/补发会把旧版错标为 Latest。
+```bash
+# 在 dev 上：
+# 1. 改 theme.css（或其他发布产物）
+# 2. bump manifest.json 的 version，例如 1.12.4
+# 3. commit + 打 tag（tag 必须无 v 前缀，必须 == version）+ 一条命令推送：
+git add -A
+git commit -m "v1.12.4: <改动摘要>"
+git tag 1.12.4
+git push origin dev --tags
+# 完成。workflow 接管，约 1 分钟后 release 上线。
+```
 
-   ```bash
-   git push origin main
-   gh release create X.Y.Z --target main --latest --title "X.Y.Z" \
-     --notes "……（累积改动）" \
-     theme.css manifest.json README.md README.zh-CN.md screenshot.png feature-artboard.png
-   ```
-5. **发完自检**（30 秒）：
-   ```bash
-   gh api repos/elijahchan2019/obsidian-opendian-theme/releases/latest --jq '.tag_name'  # 应 == manifest version，无 v
-   gh release view X.Y.Z --json assets --jq '.assets[].name'                             # theme.css / manifest.json 在
-   ```
-   两条都对，再回 Obsidian 点一次「检查更新」确认不报错。
+**就这些。** workflow 会自动：校验 tag → 镜像 dev 产物到 main（重写 name 为 `Opendian`、
+排除 AGENTS.md/.opencode/.github）→ `gh release create --latest` 挂全资产 → 自检 tag/资产/draft。
 
-**为什么 dev 的 name 是 "Opendian-dev"**：两个主题同名会在 Obsidian 里冲突。保持 dev 叫 "Opendian-dev"、main 叫 "Opendian" 才能在同一 vault 同时存在并对照调试。反向从 main cherry-pick 回 dev 时也要把 name 改回 "Opendian-dev"。
+### workflow 做了什么（无需你管，但要知道）
+
+1. **校验红线**：tag 无 `v` 前缀、tag == manifest version、theme.css 无外部网络资源、必备文件齐全。任一不过 → fail，不动 main、不发 release。
+2. **强制镜像 main**：把 dev 的发布产物（白名单：theme.css/manifest.json/README×2/截图×2/LICENSE/versions.json/.gitignore）拷到 main，**重写 manifest name 为 `Opendian`**。AGENTS.md/.opencode/.github 用白名单机制天然排除（不在名单里就不进 main）。
+3. **建 release**：`--target main --latest`，非 draft，挂全资产。
+4. **自检**：latest tag == 推送 tag、theme.css+manifest.json 在、draft=false。任一不符 → fail。
+
+### 仍需人工把关的（workflow 管不到的）
+
+- **release notes 内容**：workflow 从 commit 历史自动生成。如果要精心写 changelog，在 commit message body 里写清楚（workflow 取 commit subject）。
+- **light/dark 视觉验证**：workflow 不看截图，你必须在 dev 上肉眼验过再发版。
+- **obsidian 市场确认**：发版成功后，回 Obsidian 点「检查更新」确认不报错（这一步 workflow 替不了）。
+
+### 为什么要 tag 触发（而不是 push dev 自动发）
+
+- **防手滑**：bump version 是日常操作，但只有显式 `git tag` 才是发版意图。手滑改了 version 不会触发发版。
+- **Obsidian 官方模式**：sample-theme/plugin 都是 tag-driven release，社区最成熟。
+- **零额外工具**：tag 是 git 原生功能，不依赖 npm script 或外部 CLI。
+
+### 手动发版（仅当 workflow 故障时的应急）
+
+正常情况下**永远不要**手动发版——会让 main 状态与 workflow 不同步。仅当 workflow 本身坏了：
+
+```bash
+# 应急流程（与 workflow 逻辑等价）：
+# 1. 在 dev 上确保 manifest version 已 bump
+# 2. 切到 ../Opendian，手动同步 dev 的发布产物，改 name 为 Opendian
+# 3. push main，gh release create <version> --target main --latest --title <version> ...
+# 4. 立刻修 workflow，避免下次又得手动
+```
+
+**为什么 dev 的 name 是 "Opendian-dev"**：两个主题同名会在 Obsidian 里冲突。dev 叫 "Opendian-dev"、main 叫 "Opendian"，才能在同一 vault 同时存在并对照调试。**name 的差异现在由 workflow 在镜像时自动重写**——你本地 dev 始终是 "Opendian-dev"，无需手动切换。

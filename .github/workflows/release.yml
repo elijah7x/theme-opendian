@@ -1,0 +1,220 @@
+# Release workflow — tag-triggered, cross-branch sync (dev → main).
+#
+# Triggered by: pushing any tag (`git push --tags`).
+# What it does:
+#   1. Validates the tag (== manifest version, no `v` prefix, theme.css is self-contained).
+#   2. Mirrors dev's release artifacts onto main, rewriting manifest name → "Opendian"
+#      and stripping dev-only files (AGENTS.md, .opencode/, .github/).
+#   3. Creates a GitHub Release on main with full assets, --latest, non-draft.
+#   4. Self-checks the release (tag/version/assets/draft) and fails loud if anything is off.
+#
+# All release-compliance rules (see AGENTS.md "红线") are enforced as explicit steps,
+# not relied upon by convention. A non-compliant release would de-index the theme from
+# the community store, so this workflow is the last line of defense.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+# contents:write  → push to main + create release
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # ──────────────────────────────────────────────────────────────
+      # 1. Checkout the exact commit the tag points at (on dev).
+      #    persist-credentials keeps the GITHUB_TOKEN configured in .git
+      #    so we can push to main later in the same job.
+      # ──────────────────────────────────────────────────────────────
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to read last release's version + commit body
+          persist-credentials: true
+        # NOTE: gh authenticates automatically via GH_TOKEN env (set per-step below)
+        # — no separate `gh auth login` needed on github-hosted runners.
+
+      # ──────────────────────────────────────────────────────────────
+      # 2. Compliance gate — fail BEFORE touching main/release if any rule breaks.
+      #    These mirror AGENTS.md "红线" verbatim.
+      # ──────────────────────────────────────────────────────────────
+      - name: Read tag and manifest version
+        id: meta
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION=$(jq -r '.version' manifest.json)
+          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag:        $TAG"
+          echo "Manifest:   $VERSION"
+
+      - name: Validate tag has no `v` prefix
+        # Folio's de-index incident: a `v`-prefixed tag broke Obsidian's version lookup.
+        if: startsWith(steps.meta.outputs.tag, 'v') || startsWith(steps.meta.outputs.tag, 'V')
+        run: |
+          echo "::error::Tag '${{ steps.meta.outputs.tag }}' has a 'v' prefix. Obsidian matches the release tag to manifest.version verbatim — a 'v' prefix causes 'no GitHub release with that version'. Re-tag without the prefix."
+          exit 1
+
+      - name: Validate tag == manifest.version
+        # The single most common release failure: tag and version drift.
+        if: steps.meta.outputs.tag != steps.meta.outputs.version
+        run: |
+          echo "::error::Tag '${{ steps.meta.outputs.tag }}' != manifest.version '${{ steps.meta.outputs.version }}'. They must be identical (Obsidian looks up the release by the exact version string)."
+          exit 1
+
+      - name: Validate theme.css has no external network resources
+        # Review hard-rejects remote fonts/URLs. data: URIs are fine.
+        run: |
+          if grep -nE '(url\(|@import)' theme.css \
+               | grep -v 'data:' \
+               | grep -vE '^\s*[0-9]+:\s*/\*'; then
+            echo "::error::theme.css references external network resources (lines above). Remove them — Obsidian review requires the theme to be fully self-contained."
+            exit 1
+          fi
+          echo "theme.css is self-contained ✓"
+
+      - name: Validate required release files exist
+        run: |
+          for f in theme.css manifest.json README.md screenshot.png; do
+            [ -f "$f" ] || { echo "::error::Missing required file: $f"; exit 1; }
+          done
+          echo "Required files present ✓"
+
+      # ──────────────────────────────────────────────────────────────
+      # 3. Build the main-branch mirror: dev's release artifacts only,
+      #    with manifest name rewritten from "Opendian-dev" → "Opendian".
+      #    Whitelist approach — only listed files go to main, everything else
+      #    (AGENTS.md, .opencode/, .github/) is excluded by construction.
+      # ──────────────────────────────────────────────────────────────
+      - name: Prepare main mirror (rewrite manifest name, exclude dev-only files)
+        run: |
+          mkdir -p /tmp/mirror
+          # Whitelist of files that belong on main (the release branch).
+          for f in \
+            theme.css \
+            manifest.json \
+            README.md \
+            README.zh-CN.md \
+            screenshot.png \
+            feature-artboard.png \
+            LICENSE \
+            versions.json \
+            .gitignore; do
+            [ -f "$f" ] && cp "$f" "/tmp/mirror/$f"
+          done
+          # Rewrite manifest name. sed targets the JSON value, not the version.
+          # On dev the name is "Opendian-dev"; main must be "Opendian".
+          sed -i 's/"name": *"Opendian-dev"/"name": "Opendian"/' /tmp/mirror/manifest.json
+          # Verify the rewrite landed.
+          if ! grep -q '"name": "Opendian"' /tmp/mirror/manifest.json; then
+            echo "::error::manifest name rewrite failed. dev manifest name may have changed — update the sed pattern."
+            exit 1
+          fi
+          echo "Mirror prepared. manifest.json:"
+          cat /tmp/mirror/manifest.json
+
+      # ──────────────────────────────────────────────────────────────
+      # 4. Sync the mirror onto main. We replace main's tracked tree with
+      #    the mirror (rsync --delete after staging), so any stray dev-only
+      #    files from a prior merge get pruned automatically.
+      # ──────────────────────────────────────────────────────────────
+      - name: Sync mirror to main branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Bring in the existing main so we replace its tree rather than rewriting history.
+          git fetch origin main
+          git checkout -B main origin/main
+
+          # Wipe the working tree (keep .git) and lay down the mirror.
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -a /tmp/mirror/. .
+
+          # Stage everything; deleted files (AGENTS.md/.opencode/ from a prior leak)
+          # show up as deletions automatically.
+          git add -A
+
+          # Commit only if something changed. If main already matches the mirror
+          # (re-tag of an already-released version), skip the commit.
+          if git diff --cached --quiet; then
+            echo "No changes vs main — skipping main commit."
+          else
+            git commit -m "${{ steps.meta.outputs.tag }}: sync release artifacts from dev
+
+          Mirrored by the release workflow on tag push. manifest name rewritten to 'Opendian'; dev-only files excluded."
+            git push origin main
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # 5. Create the release. --latest (never rely on GitHub's time-based guess),
+      #    not --draft (a draft release is invisible to the store and would de-index us).
+      # ──────────────────────────────────────────────────────────────
+      - name: Build release notes (from commits since last release)
+        id: notes
+        run: |
+          LAST_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' || true)
+          if [ -n "$LAST_TAG" ] && [ "$LAST_TAG" != "${{ steps.meta.outputs.tag }}" ]; then
+            NOTES=$(git log --pretty=format:'- %s' "${LAST_TAG}..HEAD" 2>/dev/null | head -50)
+          else
+            NOTES=$(git log --pretty=format:'- %s' -5)
+          fi
+          # Multiline output via $GITHUB_ENV (more robust than $GITHUB_OUTPUT for newlines).
+          {
+            echo "RELEASE_NOTES<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release (latest, non-draft, on main)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Assemble the asset list (only include files that exist on main now).
+          ASSETS=()
+          for f in theme.css manifest.json README.md README.zh-CN.md screenshot.png feature-artboard.png; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --target main \
+            --latest \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --notes "$RELEASE_NOTES" \
+            "${ASSETS[@]}"
+
+      # ──────────────────────────────────────────────────────────────
+      # 6. Mandatory 30-second self-check. Any failure here means the release
+      #    is non-compliant and the theme may be de-indexed — fail the job loud.
+      # ──────────────────────────────────────────────────────────────
+      - name: Self-check — tag, assets, draft status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          echo "=== Check 1: latest release tag == $TAG ==="
+          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          [ "$LATEST" = "$TAG" ] || { echo "::error::Latest release is '$LATEST', expected '$TAG' (--latest may have misfired)."; exit 1; }
+          echo "  latest = $LATEST ✓"
+
+          echo "=== Check 2: required assets present ==="
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for required in theme.css manifest.json; do
+            echo "$ASSETS" | grep -qx "$required" || { echo "::error::Missing asset: $required"; exit 1; }
+          done
+          echo "  theme.css + manifest.json present ✓"
+
+          echo "=== Check 3: not a draft ==="
+          DRAFT=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[]|select(.tag_name==\"$TAG\")|.draft")
+          [ "$DRAFT" = "false" ] || { echo "::error::Release $TAG is a draft — invisible to the store, would cause de-index."; exit 1; }
+          echo "  draft = false ✓"
+
+          echo ""
+          echo "✅ All release-compliance checks passed."
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
