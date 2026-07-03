@@ -193,28 +193,54 @@ jobs:
       # 6. Mandatory 30-second self-check. Any failure here means the release
       #    is non-compliant and the theme may be de-indexed — fail the job loud.
       # ──────────────────────────────────────────────────────────────
-      - name: Self-check — tag, assets, draft status
+      - name: Self-check — tag, assets, draft status (with retry for API eventual consistency)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
-          echo "=== Check 1: latest release tag == $TAG ==="
-          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
-          [ "$LATEST" = "$TAG" ] || { echo "::error::Latest release is '$LATEST', expected '$TAG' (--latest may have misfired)."; exit 1; }
-          echo "  latest = $LATEST ✓"
 
-          echo "=== Check 2: required assets present ==="
-          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
-          for required in theme.css manifest.json; do
-            echo "$ASSETS" | grep -qx "$required" || { echo "::error::Missing asset: $required"; exit 1; }
-          done
-          echo "  theme.css + manifest.json present ✓"
+          # GitHub's APIs for /releases/latest, draft status, and asset indexing are
+          # eventually-consistent: a freshly-created release can read back as draft=true
+          # or as not-yet-Latest for a few seconds. Poll with backoff rather than failing
+          # on the first transient mismatch. Genuine failures persist across all attempts.
+
+          poll_until() {
+            # Args: label  expected_value  command_to_eval
+            local label="$1" expected="$2" cmd="$3"
+            for attempt in 1 2 3 4 5 6 7 8; do
+              local actual
+              actual=$(eval "$cmd" 2>/dev/null || echo "")
+              if [ "$actual" = "$expected" ]; then
+                echo "  $label: '$actual' ✓"
+                return 0
+              fi
+              echo "  $label: got '$actual', want '$expected' (attempt $attempt/8) — retrying in $((attempt * 3))s"
+              sleep $((attempt * 3))
+            done
+            echo "::error::$label did not converge to '$expected' after 8 attempts (last value: '$actual')."
+            exit 1
+          }
+
+          echo "=== Check 1: latest release tag == $TAG ==="
+          poll_until "latest-tag" "$TAG" \
+            'gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq ".tag_name"'
+
+          echo "=== Check 2: required assets present (theme.css + manifest.json) ==="
+          # Returns "ok" only when both required assets are in the release; "" otherwise.
+          assets_ok() {
+            local assets
+            assets=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null) || return 0
+            for required in theme.css manifest.json; do
+              grep -qx "$required" <<<"$assets" || return 0
+            done
+            echo "ok"
+          }
+          poll_until "required-assets" "ok" 'assets_ok'
 
           echo "=== Check 3: not a draft ==="
-          DRAFT=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[]|select(.tag_name==\"$TAG\")|.draft")
-          [ "$DRAFT" = "false" ] || { echo "::error::Release $TAG is a draft — invisible to the store, would cause de-index."; exit 1; }
-          echo "  draft = false ✓"
+          poll_until "draft=false" "false" \
+            'gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[]|select(.tag_name==\"$TAG\")|.draft"'
 
           echo ""
-          echo "✅ All release-compliance checks passed."
+          echo "All release-compliance checks passed."
           echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
